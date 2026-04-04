@@ -41,8 +41,8 @@ discord-bot/
 
 ### 1. Clone & masuk ke folder
 ```bash
-git clone https://github.com/username/discord-bot.git
-cd discord-bot
+git clone https://github.com/YFadila/monmod.git
+cd monmod
 ```
 
 ### 2. Buat virtual environment
