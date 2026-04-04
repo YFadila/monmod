@@ -1,59 +1,68 @@
+"""
+main.py — Entry point Discord Moderation Bot
+"""
+
 import asyncio
 import logging
 import os
-import sys
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from cogs.prefix import get_prefix   # callable prefix per-guild
 from utils.logger import setup_logger
 
 load_dotenv()
+setup_logger()
+logger = logging.getLogger("discord_bot")
 
-logger = setup_logger()
-
+# Daftar cog yang akan di-load (urutan bebas)
 COGS = [
+    "cogs.prefix",        # ← harus di-load agar get_prefix bisa bekerja
     "cogs.moderation",
     "cogs.info",
     "cogs.events",
 ]
 
-def get_prefix(bot, message):
-    return os.getenv("BOT_PREFIX", "!")
+# Inisialisasi bot
+intents = discord.Intents.default()
+intents.members         = True
+intents.message_content = True
+
+bot = commands.Bot(
+    command_prefix=get_prefix,   # callable — dipanggil tiap pesan masuk
+    intents=intents,
+    help_command=commands.DefaultHelpCommand(),
+)
 
 
-async def create_bot() -> commands.Bot:
-    intents = discord.Intents.default()
-    intents.message_content = True
-    intents.members = True
+# Events
+@bot.event
+async def on_ready():
+    logger.info(f"Bot online sebagai {bot.user} (ID: {bot.user.id})")
+    await bot.change_presence(activity=discord.Activity(
+        type=discord.ActivityType.watching,
+        name="server | @mention untuk prefix"
+    ))
 
-    bot = commands.Bot(
-        command_prefix=get_prefix,
-        intents=intents,
-        help_command=commands.DefaultHelpCommand(no_category="Umum"),
-        description="Bot moderasi server Discord",
-    )
 
+# Load semua cog
+async def load_cogs():
     for cog in COGS:
         try:
             await bot.load_extension(cog)
-            logger.info(f"✅ Cog dimuat: {cog}")
+            logger.info(f"Cog loaded: {cog}")
         except Exception as e:
-            logger.error(f"❌ Gagal memuat cog {cog}: {e}")
-
-    return bot
+            logger.error(f"Gagal load cog {cog}: {e}")
 
 
 async def main():
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        logger.critical("DISCORD_TOKEN tidak ditemukan di .env!")
-        sys.exit(1)
-
-    bot = await create_bot()
-
     async with bot:
+        await load_cogs()
+        token = os.getenv("DISCORD_TOKEN")
+        if not token:
+            raise ValueError("DISCORD_TOKEN tidak ditemukan di .env!")
         await bot.start(token)
 
 

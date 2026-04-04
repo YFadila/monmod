@@ -1,6 +1,23 @@
 """
 Cog: Moderasi
 Semua perintah moderasi server + sistem konfigurasi per-guild.
+
+Sistem Warn Decay — Hybrid (Lazy + Daily Sweep)
+────────────────────────────────────────────────
+- Setiap warn aktif punya timer decay yang dihitung dari tanggal WARN TERAKHIR
+  yang diterima member (bukan dari tanggal warn itu sendiri).
+- Jika member punya N warn aktif, poin ke-1 expire di (last_warn + 1×decay_days),
+  poin ke-2 expire di (last_warn + 2×decay_days), dst.
+- Jika member menerima warn baru, semua timer reset ulang dari tanggal warn baru itu.
+- Warn yang expire otomatis ditandai status "expired" (soft-delete) untuk audit trail.
+
+Dua lapis pengecekan:
+  1. LAZY CHECK  — dijalankan setiap kali ada aktivitas warn pada member tertentu
+                   (!warn, !warnlist, !mywarns, !clearwarns).
+  2. DAILY SWEEP — background task yang jalan sekali sehari (00:00 UTC), memproses
+                   decay untuk SEMUA member di SEMUA guild secara sekaligus.
+                   Menjamin warn yang sudah melewati batas tetap expire meski member
+                   tidak pernah berinteraksi dengan sistem warn.
 """
 
 import datetime
@@ -10,7 +27,7 @@ import os
 from pathlib import Path
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from utils import embeds
 
@@ -31,14 +48,20 @@ DEFAULT_CONFIG = {
     },
     # Durasi auto-timeout (menit) saat threshold "timeout" tercapai
     "timeout_duration": 5,
+    # Durasi decay warn (hari). Setiap poin butuh kelipatan ini tanpa pelanggaran.
+    # Contoh: decay=30, 2 warn → poin 1 hilang di hari ke-30, poin 2 di hari ke-60
+    # Set ke 0 untuk menonaktifkan decay (warn tidak pernah expire otomatis)
+    "warn_decay_days": 30,
     # ID channel log moderasi (override .env per-guild, null = pakai .env)
     "log_channel_id": None,
 }
 
-# Batas nilai yang boleh diset agar tidak disalahgunakan
-VALID_ACTIONS    = {"timeout", "kick", "ban", "none"}
-MAX_WARN_COUNT   = 50          # maksimum threshold warn yang masuk akal
-MAX_TIMEOUT_MIN  = 40320       # 28 hari (batas Discord)
+# Batas nilai
+VALID_ACTIONS   = {"timeout", "kick", "ban", "none"}
+MAX_WARN_COUNT  = 50
+MAX_TIMEOUT_MIN = 40320    # 28 hari (batas Discord)
+MAX_DECAY_DAYS  = 365
+
 
 # Helper: guild config
 def _load_config() -> dict:
@@ -61,35 +84,27 @@ def _save_config(data: dict) -> None:
 
 
 def get_guild_config(guild_id: int) -> dict:
-    """
-    Kembalikan config untuk guild tertentu.
-    Field yang belum diset akan di-fallback ke DEFAULT_CONFIG.
-    """
-    raw = _load_config()
+    """Kembalikan config guild dengan fallback ke DEFAULT_CONFIG."""
+    raw       = _load_config()
     guild_cfg = raw.get(str(guild_id), {})
-
-    # Deep-merge: ambil default, timpa dengan nilai guild jika ada
-    cfg = {
+    return {
         "warn_thresholds": {
             **DEFAULT_CONFIG["warn_thresholds"],
             **guild_cfg.get("warn_thresholds", {}),
         },
         "timeout_duration": guild_cfg.get("timeout_duration", DEFAULT_CONFIG["timeout_duration"]),
+        "warn_decay_days":  guild_cfg.get("warn_decay_days",  DEFAULT_CONFIG["warn_decay_days"]),
         "log_channel_id":   guild_cfg.get("log_channel_id",   DEFAULT_CONFIG["log_channel_id"]),
     }
-    return cfg
 
 
 def _set_guild_value(guild_id: int, key: str, value) -> None:
-    """Set satu key di config guild, lalu simpan."""
     raw = _load_config()
-    gk  = str(guild_id)
-    raw.setdefault(gk, {})[key] = value
+    raw.setdefault(str(guild_id), {})[key] = value
     _save_config(raw)
 
 
 def _reset_guild_config(guild_id: int) -> None:
-    """Hapus seluruh config custom guild (kembali ke default)."""
     raw = _load_config()
     raw.pop(str(guild_id), None)
     _save_config(raw)
@@ -116,6 +131,7 @@ def _save_warns(data: dict) -> None:
 
 
 def _get_member_warns(data: dict, guild_id: int, member_id: int) -> list:
+    """Kembalikan seluruh warn entry milik member (semua status)."""
     return data.get(str(guild_id), {}).get(str(member_id), [])
 
 
@@ -124,9 +140,11 @@ def _add_warn_entry(data: dict, guild_id: int, member_id: int, entry: dict) -> N
 
 
 def _get_active_warns(data: dict, guild_id: int, member_id: int) -> list:
-    """Kembalikan hanya warn yang masih aktif (belum di-clear)."""
-    all_warns = _get_member_warns(data, guild_id, member_id)
-    return [w for w in all_warns if w.get("status", "active") == "active"]
+    """Kembalikan warn yang masih aktif (belum di-clear/expired)."""
+    return [
+        w for w in _get_member_warns(data, guild_id, member_id)
+        if w.get("status", "active") == "active"
+    ]
 
 
 def _soft_clear_warns(
@@ -137,12 +155,8 @@ def _soft_clear_warns(
     cleared_by_nama: str,
     alasan_clear: str = "Tidak ada alasan.",
 ) -> int:
-    """
-    Tandai semua warn aktif sebagai 'cleared' (soft-delete).
-    Kembalikan jumlah warn yang di-clear.
-    """
-    gk, mk = str(guild_id), str(member_id)
-    warn_list = data.get(gk, {}).get(mk, [])
+    """Tandai semua warn aktif sebagai 'cleared'. Kembalikan jumlah yang di-clear."""
+    warn_list   = data.get(str(guild_id), {}).get(str(member_id), [])
     waktu_clear = discord.utils.utcnow().isoformat()
     count = 0
     for w in warn_list:
@@ -156,17 +170,157 @@ def _soft_clear_warns(
     return count
 
 
+# Sistem Decay — lazy check
+def process_warn_decay(data: dict, guild_id: int, member_id: int, decay_days: int) -> int:
+    """
+    Hitung dan terapkan decay warn secara lazy.
+
+    Algoritma:
+    1. Ambil semua warn aktif, urutkan dari terlama ke terbaru.
+    2. Cari tanggal warn TERAKHIR (most recent active warn) sebagai anchor.
+    3. Poin ke-N expire jika: sekarang >= anchor + (N × decay_days).
+       - Poin terlama (index 0) expire duluan di anchor + 1×decay_days
+       - Poin berikutnya (index 1) expire di anchor + 2×decay_days, dst.
+    4. Warn yang expire ditandai status "expired".
+
+    Kembalikan jumlah warn yang baru saja di-expire.
+    """
+    if decay_days <= 0:
+        return 0   # decay dinonaktifkan
+
+    active = _get_active_warns(data, guild_id, member_id)
+    if not active:
+        return 0
+
+    # Urutkan dari terlama ke terbaru berdasarkan waktu pemberian
+    active_sorted = sorted(active, key=lambda w: w.get("waktu", ""))
+
+    # Anchor: tanggal warn aktif PALING BARU
+    try:
+        anchor = datetime.datetime.fromisoformat(active_sorted[-1]["waktu"])
+        # Pastikan timezone-aware
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=datetime.timezone.utc)
+    except (KeyError, ValueError):
+        return 0
+
+    now    = discord.utils.utcnow()
+    count  = 0
+    expire_ts = now.isoformat()
+
+    for i, w in enumerate(active_sorted):
+        # Poin ke-(i+1) butuh (i+1) × decay_days hari bersih
+        needed_days = (i + 1) * decay_days
+        expire_at   = anchor + datetime.timedelta(days=needed_days)
+        if now >= expire_at:
+            w["status"]         = "expired"
+            w["expired_waktu"]  = expire_ts
+            count += 1
+
+    return count
+
+
+# Helper tampilan — sisa waktu decay untuk warn aktif
+def _decay_info(active_sorted: list, decay_days: int) -> list[str]:
+    """
+    Untuk tiap warn aktif (urutan terlama→terbaru), kembalikan string
+    berisi kapan warn itu akan expire.
+    """
+    if decay_days <= 0 or not active_sorted:
+        return ["*(decay nonaktif)*"] * len(active_sorted)
+
+    try:
+        anchor = datetime.datetime.fromisoformat(active_sorted[-1]["waktu"])
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=datetime.timezone.utc)
+    except (KeyError, ValueError):
+        return ["?"] * len(active_sorted)
+
+    result = []
+    for i in range(len(active_sorted)):
+        expire_at = anchor + datetime.timedelta(days=(i + 1) * decay_days)
+        result.append(discord.utils.format_dt(expire_at, style="R"))   # "in 23 days"
+    return result
+
+
 # Cog utama
 class Moderation(commands.Cog, name="Moderasi"):
     """Perintah-perintah moderasi server."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._daily_decay_task.start()   # mulai background task saat cog di-load
 
-    # ── Log channel (mendukung config per-guild) ───────────────────────────
+    def cog_unload(self):
+        self._daily_decay_task.cancel()  # hentikan task saat cog di-unload / bot restart
+
+    # ── Daily sweep — background task ─────────────────────────────────────
+    @tasks.loop(hours=24)
+    async def _daily_decay_task(self):
+        """
+        Sweep decay warn untuk semua member di semua guild, sekali sehari.
+        Dijalankan otomatis; tidak ada output ke channel kecuali ada yang expire.
+        """
+        await self.bot.wait_until_ready()
+
+        data       = _load_warns()
+        config_raw = _load_config()
+        changed    = False
+        total      = 0
+
+        for guild_id_str, members in data.items():
+            try:
+                guild_id   = int(guild_id_str)
+                guild_cfg  = config_raw.get(guild_id_str, {})
+                decay_days = guild_cfg.get("warn_decay_days", DEFAULT_CONFIG["warn_decay_days"])
+            except (ValueError, KeyError):
+                continue
+
+            if decay_days <= 0:
+                continue   # decay nonaktif untuk guild ini
+
+            for member_id_str in list(members.keys()):
+                try:
+                    member_id = int(member_id_str)
+                except ValueError:
+                    continue
+
+                expired = process_warn_decay(data, guild_id, member_id, decay_days)
+                if expired:
+                    total   += expired
+                    changed  = True
+                    logger.info(
+                        f"DAILY-SWEEP | {expired} warn expire "
+                        f"[guild={guild_id} member={member_id}]"
+                    )
+
+        if changed:
+            _save_warns(data)
+            logger.info(f"DAILY-SWEEP selesai | Total warn di-expire: {total}")
+        else:
+            logger.debug("DAILY-SWEEP selesai | Tidak ada warn yang expire.")
+
+    @_daily_decay_task.before_loop
+    async def _before_daily_decay(self):
+        """
+        Tunda task pertama agar mulai mendekati 00:00 UTC berikutnya.
+        Ini mencegah sweep terjadi di jam acak saat bot restart.
+        """
+        await self.bot.wait_until_ready()
+        now        = discord.utils.utcnow()
+        tomorrow   = (now + datetime.timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        wait_secs  = (tomorrow - now).total_seconds()
+        logger.info(
+            f"DAILY-SWEEP dijadwalkan pertama kali dalam "
+            f"{wait_secs / 3600:.1f} jam (00:00 UTC)."
+        )
+        await discord.utils.sleep_until(tomorrow)
+
+    # ── Log channel ───────────────────────────────────────────────────────
     async def send_log(self, guild: discord.Guild, embed: discord.Embed):
-        """Kirim log ke channel moderasi. Prioritas: config guild → env LOG_CHANNEL_ID."""
-        cfg = get_guild_config(guild.id)
+        cfg        = get_guild_config(guild.id)
         channel_id = cfg["log_channel_id"] or os.getenv("LOG_CHANNEL_ID")
         if channel_id:
             channel = guild.get_channel(int(channel_id))
@@ -196,11 +350,10 @@ class Moderation(commands.Cog, name="Moderasi"):
                 await member.timeout(until, reason=reason_auto)
             except discord.Forbidden:
                 return "⚠️ Gagal timeout otomatis (kurang izin)."
-            log_embed = embeds.mod_action(
+            await self.send_log(ctx.guild, embeds.mod_action(
                 f"⏱️ Auto-Timeout {timeout_dur} Menit",
                 member, self.bot.user, reason_auto, discord.Color.yellow()
-            )
-            await self.send_log(ctx.guild, log_embed)
+            ))
             logger.info(f"AUTO-TIMEOUT | {member} selama {timeout_dur}m (warn ke-{warn_count})")
             return f"⏱️ **Auto-timeout {timeout_dur} menit** ({warn_count} warn)"
 
@@ -224,8 +377,7 @@ class Moderation(commands.Cog, name="Moderasi"):
 
         return None
 
-    # GRUP PERINTAH: config  (!config ...)
-    # Hanya administrator guild yang boleh menggunakan perintah ini.
+    # GRUP PERINTAH: config
     @commands.group(
         name="config",
         invoke_without_command=True,
@@ -234,29 +386,26 @@ class Moderation(commands.Cog, name="Moderasi"):
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     async def config_group(self, ctx):
-        """Tampilkan semua sub-perintah config yang tersedia."""
         embed = discord.Embed(
             title="⚙️ Perintah Config",
             color=discord.Color.blurple(),
-            description=(
-                "Gunakan sub-perintah berikut untuk mengatur bot di server ini.\n"
-                "Semua perubahan hanya berlaku untuk server ini."
-            )
+            description="Gunakan sub-perintah berikut. Semua perubahan hanya berlaku untuk server ini."
         )
         embed.add_field(
             name="Sub-perintah",
             value=(
                 "`!config show` — Lihat config aktif\n"
-                "`!config setwarn <jumlah> <aksi>` — Atur aksi pada warn ke-N\n"
-                "`!config removewarn <jumlah>` — Hapus threshold warn\n"
+                "`!config setwarn <N> <aksi>` — Atur aksi pada warn ke-N\n"
+                "`!config removewarn <N>` — Hapus threshold warn ke-N\n"
                 "`!config setTimeout <menit>` — Atur durasi auto-timeout\n"
+                "`!config setdecay <hari>` — Atur durasi decay warn (0 = nonaktif)\n"
                 "`!config setlog <#channel | clear>` — Atur channel log moderasi\n"
                 "`!config reset` — Kembalikan semua config ke default\n"
             ),
             inline=False
         )
         embed.add_field(
-            name="Aksi yang tersedia",
+            name="Aksi tersedia untuk setwarn",
             value="`timeout` · `kick` · `ban` · `none` (nonaktifkan threshold)",
             inline=False
         )
@@ -278,96 +427,79 @@ class Moderation(commands.Cog, name="Moderasi"):
 
         # Threshold warn
         thresholds = cfg["warn_thresholds"]
-        if thresholds:
-            th_lines = "\n".join(
-                f"Warn **{k}×** → `{v}`"
-                for k, v in sorted(thresholds.items(), key=lambda x: int(x[0]))
-            )
-        else:
-            th_lines = "*(tidak ada threshold)*"
+        th_lines = "\n".join(
+            f"Warn **{k}×** → `{v}`"
+            for k, v in sorted(thresholds.items(), key=lambda x: int(x[0]))
+        ) if thresholds else "*(tidak ada threshold)*"
         embed.add_field(name="📊 Threshold Warn", value=th_lines, inline=False)
 
-        # Durasi timeout
+        # Durasi timeout & decay
         embed.add_field(
             name="⏱️ Durasi Auto-Timeout",
             value=f"**{cfg['timeout_duration']} menit**",
             inline=True
         )
+        decay = cfg["warn_decay_days"]
+        embed.add_field(
+            name="⏳ Decay Warn",
+            value=f"**{decay} hari** per poin" if decay > 0 else "**Nonaktif**",
+            inline=True
+        )
 
         # Log channel
-        log_id = cfg["log_channel_id"] or os.getenv("LOG_CHANNEL_ID")
+        log_id  = cfg["log_channel_id"] or os.getenv("LOG_CHANNEL_ID")
         log_val = f"<#{log_id}>" if log_id else "*(belum diatur)*"
         embed.add_field(name="📋 Log Channel", value=log_val, inline=True)
 
         embed.set_footer(text="Gunakan !config untuk melihat daftar perintah pengaturan.")
         await ctx.send(embed=embed)
 
-    # ── !config setwarn <jumlah> <aksi> ──────────────────────────────────
-    @config_group.command(
-        name="setwarn",
-        help="Atur tindakan otomatis pada warn ke-N. Contoh: !config setwarn 3 timeout"
-    )
+    # ── !config setwarn ───────────────────────────────────────────────────
+    @config_group.command(name="setwarn", help="Atur tindakan otomatis pada warn ke-N. Contoh: !config setwarn 3 timeout")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     async def config_setwarn(self, ctx, jumlah: int, aksi: str):
         aksi = aksi.lower()
-
         if jumlah < 1 or jumlah > MAX_WARN_COUNT:
             return await ctx.send(embed=embeds.error(f"Jumlah warn harus antara 1–{MAX_WARN_COUNT}."))
         if aksi not in VALID_ACTIONS:
-            return await ctx.send(
-                embed=embeds.error(f"Aksi tidak valid. Pilihan: `{'` · `'.join(VALID_ACTIONS)}`")
-            )
+            return await ctx.send(embed=embeds.error(f"Aksi tidak valid. Pilihan: `{'` · `'.join(VALID_ACTIONS)}`"))
 
         raw = _load_config()
-        gk  = str(ctx.guild.id)
-        raw.setdefault(gk, {}).setdefault("warn_thresholds", {})[str(jumlah)] = aksi
+        raw.setdefault(str(ctx.guild.id), {}).setdefault("warn_thresholds", {})[str(jumlah)] = aksi
         _save_config(raw)
 
-        if aksi == "none":
-            desc = f"Threshold warn **{jumlah}×** dinonaktifkan."
-        else:
-            desc = f"Warn **{jumlah}×** sekarang akan memicu **{aksi}** otomatis."
-
+        desc = (f"Threshold warn **{jumlah}×** dinonaktifkan." if aksi == "none"
+                else f"Warn **{jumlah}×** sekarang akan memicu **{aksi}** otomatis.")
         await ctx.send(embed=embeds.success(desc, title="✅ Threshold Diperbarui"))
         logger.info(f"CONFIG setwarn | Guild {ctx.guild.id} | warn {jumlah} → {aksi} oleh {ctx.author}")
 
-    # ── !config removewarn <jumlah> ──────────────────────────────────────
-    @config_group.command(
-        name="removewarn",
-        help="Hapus threshold warn pada angka tertentu. Contoh: !config removewarn 5"
-    )
+    # ── !config removewarn ────────────────────────────────────────────────
+    @config_group.command(name="removewarn", help="Hapus threshold warn pada angka tertentu.")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     async def config_removewarn(self, ctx, jumlah: int):
-        raw = _load_config()
-        gk  = str(ctx.guild.id)
+        raw        = _load_config()
+        gk         = str(ctx.guild.id)
         thresholds = raw.get(gk, {}).get("warn_thresholds", {})
-
         if str(jumlah) not in thresholds:
             return await ctx.send(embed=embeds.error(f"Tidak ada threshold custom untuk warn ke-**{jumlah}**."))
-
         del thresholds[str(jumlah)]
         raw.setdefault(gk, {})["warn_thresholds"] = thresholds
         _save_config(raw)
-
         await ctx.send(embed=embeds.success(
-            f"Threshold warn **{jumlah}×** dihapus. Bot akan kembali ke default jika ada.",
+            f"Threshold warn **{jumlah}×** dihapus.",
             title="🗑️ Threshold Dihapus"
         ))
         logger.info(f"CONFIG removewarn | Guild {ctx.guild.id} | hapus threshold {jumlah} oleh {ctx.author}")
 
-    # ── !config setTimeout <menit> ────────────────────────────────────────
-    @config_group.command(
-        name="setTimeout",
-        help="Atur durasi auto-timeout (menit). Contoh: !config setTimeout 10"
-    )
+    # ── !config setTimeout ────────────────────────────────────────────────
+    @config_group.command(name="setTimeout", help="Atur durasi auto-timeout (menit). Contoh: !config setTimeout 10")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     async def config_set_timeout(self, ctx, menit: int):
         if menit < 1 or menit > MAX_TIMEOUT_MIN:
-            return await ctx.send(embed=embeds.error(f"Durasi harus antara 1–{MAX_TIMEOUT_MIN} menit (28 hari)."))
-
+            return await ctx.send(embed=embeds.error(f"Durasi harus antara 1–{MAX_TIMEOUT_MIN} menit."))
         _set_guild_value(ctx.guild.id, "timeout_duration", menit)
         await ctx.send(embed=embeds.success(
             f"Durasi auto-timeout diatur ke **{menit} menit**.",
@@ -375,33 +507,52 @@ class Moderation(commands.Cog, name="Moderasi"):
         ))
         logger.info(f"CONFIG setTimeout | Guild {ctx.guild.id} | {menit}m oleh {ctx.author}")
 
-    # ── !config setlog <#channel | clear> ────────────────────────────────
+    # ── !config setdecay ──────────────────────────────────────────────────
     @config_group.command(
-        name="setlog",
-        help="Atur channel log moderasi. Gunakan 'clear' untuk menghapus. Contoh: !config setlog #mod-log"
+        name="setdecay",
+        help=(
+            "Atur durasi decay warn per poin (hari). "
+            "Contoh: !config setdecay 30  |  Gunakan 0 untuk menonaktifkan decay."
+        )
     )
+    @commands.has_permissions(administrator=True)
+    @commands.guild_only()
+    async def config_set_decay(self, ctx, hari: int):
+        if hari < 0 or hari > MAX_DECAY_DAYS:
+            return await ctx.send(embed=embeds.error(f"Durasi decay harus antara 0–{MAX_DECAY_DAYS} hari."))
+
+        _set_guild_value(ctx.guild.id, "warn_decay_days", hari)
+
+        if hari == 0:
+            desc = "Decay warn **dinonaktifkan**. Warn aktif tidak akan expire otomatis."
+        else:
+            desc = (
+                f"Durasi decay diatur ke **{hari} hari** per poin.\n"
+                f"Contoh: member dengan 2 warn aktif akan kehilangan poin ke-1 setelah "
+                f"**{hari} hari** tanpa pelanggaran, dan poin ke-2 setelah **{hari * 2} hari**."
+            )
+        await ctx.send(embed=embeds.success(desc, title="✅ Decay Warn Diperbarui"))
+        logger.info(f"CONFIG setdecay | Guild {ctx.guild.id} | {hari} hari oleh {ctx.author}")
+
+    # ── !config setlog ────────────────────────────────────────────────────
+    @config_group.command(name="setlog", help="Atur channel log moderasi. Contoh: !config setlog #mod-log")
     @commands.has_permissions(administrator=True)
     @commands.guild_only()
     async def config_set_log(self, ctx, *, target: str):
         target = target.strip()
-
         if target.lower() == "clear":
             _set_guild_value(ctx.guild.id, "log_channel_id", None)
             return await ctx.send(embed=embeds.success(
                 "Log channel dihapus. Bot akan pakai `LOG_CHANNEL_ID` dari env (jika ada).",
                 title="✅ Log Channel Dihapus"
             ))
-
-        # Coba parse mention channel atau ID
         channel = None
         if ctx.message.channel_mentions:
             channel = ctx.message.channel_mentions[0]
         elif target.isdigit():
             channel = ctx.guild.get_channel(int(target))
-
         if not channel:
             return await ctx.send(embed=embeds.error("Channel tidak ditemukan. Mention channel atau kirim ID-nya."))
-
         _set_guild_value(ctx.guild.id, "log_channel_id", channel.id)
         await ctx.send(embed=embeds.success(
             f"Log moderasi akan dikirim ke {channel.mention}.",
@@ -422,7 +573,7 @@ class Moderation(commands.Cog, name="Moderasi"):
         logger.info(f"CONFIG reset | Guild {ctx.guild.id} oleh {ctx.author}")
 
     # PERINTAH: warn
-    @commands.command(name="warn", help="Beri peringatan ke member (dikirim langsung di channel).")
+    @commands.command(name="warn", help="Beri peringatan ke member (dikirim via DM).")
     @commands.has_permissions(manage_messages=True)
     @commands.guild_only()
     async def warn(self, ctx, member: discord.Member, *, alasan: str = "Tidak ada alasan."):
@@ -431,7 +582,18 @@ class Moderation(commands.Cog, name="Moderasi"):
         if member.top_role >= ctx.author.top_role:
             return await ctx.send(embed=embeds.error("Kamu tidak bisa warn member dengan role lebih tinggi."))
 
+        cfg        = get_guild_config(ctx.guild.id)
+        decay_days = cfg["warn_decay_days"]
+
         data = _load_warns()
+
+        # ── Lazy decay: cek expire SEBELUM tambah warn baru ───────────────
+        expired = process_warn_decay(data, ctx.guild.id, member.id, decay_days)
+        if expired:
+            _save_warns(data)
+            logger.info(f"DECAY | {expired} warn {member} expire sebelum warn baru")
+
+        # ── Tambah warn baru ───────────────────────────────────────────────
         entry = {
             "status":    "active",
             "alasan":    alasan,
@@ -442,113 +604,229 @@ class Moderation(commands.Cog, name="Moderasi"):
         _add_warn_entry(data, ctx.guild.id, member.id, entry)
         _save_warns(data)
 
-        warn_count = len(_get_active_warns(data, ctx.guild.id, member.id))
+        active_warns = _get_active_warns(data, ctx.guild.id, member.id)
+        warn_count   = len(active_warns)
 
+        # ── Info decay untuk DM ────────────────────────────────────────────
+        decay_note = ""
+        if decay_days > 0:
+            decay_note = (
+                f"\n**Decay:** Poin ke-{warn_count} akan hilang otomatis dalam "
+                f"**{warn_count * decay_days} hari** tanpa pelanggaran."
+            )
+
+        # ── DM ke member ───────────────────────────────────────────────────
+        try:
+            dm_embed = embeds.warning(
+                f"Kamu mendapat peringatan di **{ctx.guild.name}**.\n"
+                f"**Alasan:** {alasan}\n"
+                f"**Total peringatan aktif:** {warn_count}"
+                f"{decay_note}",
+                title="⚠️ Peringatan"
+            )
+            await member.send(embed=dm_embed)
+            dm_status = "📨 DM terkirim"
+        except discord.Forbidden:
+            dm_status = "⚠️ DM diblokir"
+
+        # ── Embed konfirmasi di channel ────────────────────────────────────
         embed = embeds.mod_action("⚠️ Member Diperingatkan", member, ctx.author, alasan, discord.Color.gold())
-        embed.add_field(name="Total Warn", value=f"**{warn_count}** peringatan", inline=True)
+        embed.add_field(name="Total Warn Aktif", value=f"**{warn_count}** poin", inline=True)
+        embed.add_field(name="Status DM",        value=dm_status,                inline=True)
+
+        if decay_days > 0:
+            embed.add_field(
+                name="⏳ Decay",
+                value=(
+                    f"Timer decay semua poin di-reset.\n"
+                    f"Poin ke-1 expire {discord.utils.format_dt(discord.utils.utcnow() + datetime.timedelta(days=decay_days), style='R')}."
+                ),
+                inline=False
+            )
 
         action_taken = await self._apply_threshold_action(ctx, member, warn_count)
         if action_taken:
             embed.add_field(name="Tindakan Otomatis", value=action_taken, inline=False)
 
-        await ctx.send(content=f"Halo {member.mention}, kamu mendapatkan peringatan!", embed=embed)
+        await ctx.send(embed=embed)
         await self.send_log(ctx.guild, embed)
         logger.info(f"WARN #{warn_count} | {member} oleh {ctx.author} | Alasan: {alasan}")
 
-    # PERINTAH: warnlist
+    # PERINTAH: warnlist  (khusus moderator — bisa lihat warn siapapun)
     @commands.command(name="warnlist", aliases=["warns", "warnhistory"], help="Lihat riwayat warn member.")
     @commands.has_permissions(manage_messages=True)
     @commands.guild_only()
     async def warnlist(self, ctx, member: discord.Member):
-        data      = _load_warns()
-        all_warns = _get_member_warns(data, ctx.guild.id, member.id)
+        cfg        = get_guild_config(ctx.guild.id)
+        decay_days = cfg["warn_decay_days"]
 
-        if not all_warns:
-            return await ctx.send(embed=embeds.success(
-                f"{member.mention} tidak memiliki riwayat peringatan.",
-                title="📋 Riwayat Warn"
-            ))
+        data = _load_warns()
 
+        # Lazy decay sebelum tampilkan
+        expired = process_warn_decay(data, ctx.guild.id, member.id, decay_days)
+        if expired:
+            _save_warns(data)
+
+        await self._send_warnlist_embed(ctx, member, data, decay_days, expired)
+
+    # PERINTAH: mywarns  (semua user — hanya bisa lihat warn sendiri)
+    @commands.command(name="mywarns", help="Lihat riwayat warnmu sendiri (hanya bisa melihat milik sendiri).")
+    @commands.guild_only()
+    async def mywarns(self, ctx):
+        cfg        = get_guild_config(ctx.guild.id)
+        decay_days = cfg["warn_decay_days"]
+
+        data = _load_warns()
+
+        # Lazy decay sebelum tampilkan
+        expired = process_warn_decay(data, ctx.guild.id, ctx.author.id, decay_days)
+        if expired:
+            _save_warns(data)
+
+        # Kirim via DM agar tidak terekspos di channel publik
+        try:
+            await self._send_warnlist_embed(ctx, ctx.author, data, decay_days, expired, via_dm=True)
+            if ctx.guild:   # Konfirmasi singkat di channel
+                await ctx.send(
+                    embed=embeds.success("Riwayat warnmu sudah dikirim ke DM kamu. 📨", title="📋 My Warns"),
+                    delete_after=10
+                )
+        except discord.Forbidden:
+            # DM diblokir, tampilkan di channel saja
+            await self._send_warnlist_embed(ctx, ctx.author, data, decay_days, expired)
+
+    # ── Helper: kirim embed warnlist ──────────────────────────────────────
+    async def _send_warnlist_embed(
+        self,
+        ctx: commands.Context,
+        member: discord.Member | discord.User,
+        data: dict,
+        decay_days: int,
+        auto_expired: int = 0,
+        via_dm: bool = False,
+    ):
+        all_warns     = _get_member_warns(data, ctx.guild.id, member.id)
         active_warns  = [w for w in all_warns if w.get("status", "active") == "active"]
         cleared_warns = [w for w in all_warns if w.get("status") == "cleared"]
+        expired_warns = [w for w in all_warns if w.get("status") == "expired"]
 
+        dest = member if via_dm else ctx   # kirim ke DM atau channel
+
+        if not all_warns:
+            embed = embeds.success(
+                f"{'Kamu' if via_dm else member.mention} tidak memiliki riwayat peringatan.",
+                title="📋 Riwayat Warn"
+            )
+            await dest.send(embed=embed)
+            return
+
+        # Urutkan active dari terlama ke terbaru untuk kalkulasi decay
+        active_sorted  = sorted(active_warns, key=lambda w: w.get("waktu", ""))
+        decay_countdowns = _decay_info(active_sorted, decay_days)
+
+        display_name = "Kamu" if via_dm else member.display_name
         embed = discord.Embed(
-            title=f"📋 Riwayat Warn — {member.display_name}",
+            title=f"📋 Riwayat Warn — {display_name}",
             color=discord.Color.orange(),
             timestamp=discord.utils.utcnow(),
         )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.add_field(
-            name="Ringkasan",
-            value=(
-                f"🔴 Warn aktif: **{len(active_warns)}**\n"
-                f"✅ Pernah di-clear: **{len(cleared_warns)}**\n"
-                f"📊 Total sepanjang waktu: **{len(all_warns)}**"
-            ),
-            inline=False
-        )
+        if hasattr(member, "display_avatar"):
+            embed.set_thumbnail(url=member.display_avatar.url)
 
-        # ── Warn aktif ────────────────────────────────────────────────────
-        if active_warns:
+        # Ringkasan
+        decay_str = f"**{decay_days} hari** per poin" if decay_days > 0 else "Nonaktif"
+        ringkasan = (
+            f"🔴 Warn aktif: **{len(active_warns)}** poin\n"
+            f"✅ Di-clear manual: **{len(cleared_warns)}**\n"
+            f"💨 Expire otomatis: **{len(expired_warns)}**\n"
+            f"📊 Total sepanjang waktu: **{len(all_warns)}**\n"
+            f"⏳ Decay: {decay_str}"
+        )
+        if auto_expired:
+            ringkasan += f"\n\n*({auto_expired} warn baru saja expire saat kamu membuka riwayat ini)*"
+        embed.add_field(name="Ringkasan", value=ringkasan, inline=False)
+
+        # ── Warn aktif + countdown decay ──────────────────────────────────
+        if active_sorted:
             embed.add_field(name="─── ⚠️ Warn Aktif ───", value="", inline=False)
-            display_active = active_warns[-5:]   # maks 5 terbaru
-            if len(active_warns) > 5:
+            display_active = active_sorted[-5:]
+            if len(active_sorted) > 5:
                 embed.add_field(
-                    name="",
-                    value=f"*...dan {len(active_warns) - 5} warn aktif lainnya (menampilkan 5 terbaru)*",
-                    inline=False
+                    name="", inline=False,
+                    value=f"*...dan {len(active_sorted) - 5} warn aktif lainnya (menampilkan 5 terbaru)*"
                 )
-            offset = len(active_warns) - len(display_active) + 1
-            for i, w in enumerate(display_active, start=offset):
+            # Sesuaikan offset countdown dengan slice yang ditampilkan
+            start_idx = len(active_sorted) - len(display_active)
+            for i, w in enumerate(display_active):
+                global_i    = start_idx + i          # index dalam active_sorted
+                warn_num    = global_i + 1            # nomor urut poin (1-based)
+                countdown   = decay_countdowns[global_i]
                 try:
-                    waktu_str = discord.utils.format_dt(datetime.datetime.fromisoformat(w["waktu"]), style="d")
+                    waktu_str = discord.utils.format_dt(
+                        datetime.datetime.fromisoformat(w["waktu"]), style="d"
+                    )
                 except (KeyError, ValueError):
                     waktu_str = "Tidak diketahui"
                 embed.add_field(
-                    name=f"Warn #{i} 🔴",
+                    name=f"Poin #{warn_num} 🔴",
                     value=(
                         f"**Alasan:** {w.get('alasan', '-')}\n"
                         f"**Oleh:** {w.get('oleh_nama', 'Unknown')} (<@{w.get('oleh_id', 0)}>)\n"
-                        f"**Tanggal:** {waktu_str}"
+                        f"**Tanggal:** {waktu_str}\n"
+                        f"**Expire:** {countdown}"
                     ),
                     inline=False,
                 )
 
-        # ── Riwayat warn yang sudah di-clear ──────────────────────────────
+        # ── Warn yang sudah di-clear manual ───────────────────────────────
         if cleared_warns:
-            embed.add_field(name="─── 🧹 Riwayat Clear Warn ───", value="", inline=False)
-            display_cleared = cleared_warns[-5:]   # maks 5 terbaru
-            if len(cleared_warns) > 5:
-                embed.add_field(
-                    name="",
-                    value=f"*...dan {len(cleared_warns) - 5} warn cleared lainnya (menampilkan 5 terbaru)*",
-                    inline=False
-                )
-            # Kelompokkan per sesi clear (cleared_waktu yang sama = satu aksi clearwarns)
-            # Tampilkan langsung per warn entry agar detail terlihat
-            for i, w in enumerate(display_cleared, start=1):
+            embed.add_field(name="─── 🧹 Di-clear Manual ───", value="", inline=False)
+            for w in cleared_warns[-3:]:
                 try:
-                    warn_waktu = discord.utils.format_dt(datetime.datetime.fromisoformat(w["waktu"]), style="d")
+                    warn_waktu  = discord.utils.format_dt(datetime.datetime.fromisoformat(w["waktu"]), style="d")
                 except (KeyError, ValueError):
                     warn_waktu = "?"
                 try:
                     clear_waktu = discord.utils.format_dt(datetime.datetime.fromisoformat(w["cleared_waktu"]), style="d")
                 except (KeyError, ValueError):
                     clear_waktu = "?"
-
                 embed.add_field(
-                    name=f"Warn (cleared) ✅",
+                    name="Warn (cleared) ✅",
                     value=(
                         f"**Alasan warn:** {w.get('alasan', '-')} *(diberi {warn_waktu})*\n"
-                        f"**Di-clear oleh:** {w.get('cleared_by_nama', 'Unknown')} "
-                        f"(<@{w.get('cleared_by_id', 0)}>)\n"
+                        f"**Di-clear oleh:** {w.get('cleared_by_nama', 'Unknown')} (<@{w.get('cleared_by_id', 0)}>)\n"
                         f"**Alasan clear:** {w.get('cleared_alasan', '-')}\n"
                         f"**Tanggal clear:** {clear_waktu}"
                     ),
                     inline=False,
                 )
+            if len(cleared_warns) > 3:
+                embed.add_field(name="", value=f"*...dan {len(cleared_warns) - 3} riwayat clear lainnya*", inline=False)
 
-        await ctx.send(embed=embed)
+        # ── Warn yang expire otomatis ──────────────────────────────────────
+        if expired_warns:
+            embed.add_field(name="─── 💨 Expire Otomatis ───", value="", inline=False)
+            for w in expired_warns[-3:]:
+                try:
+                    warn_waktu = discord.utils.format_dt(datetime.datetime.fromisoformat(w["waktu"]), style="d")
+                except (KeyError, ValueError):
+                    warn_waktu = "?"
+                try:
+                    exp_waktu = discord.utils.format_dt(datetime.datetime.fromisoformat(w["expired_waktu"]), style="d")
+                except (KeyError, ValueError):
+                    exp_waktu = "?"
+                embed.add_field(
+                    name="Warn (expired) 💨",
+                    value=(
+                        f"**Alasan:** {w.get('alasan', '-')} *(diberi {warn_waktu})*\n"
+                        f"**Expire pada:** {exp_waktu}"
+                    ),
+                    inline=False,
+                )
+            if len(expired_warns) > 3:
+                embed.add_field(name="", value=f"*...dan {len(expired_warns) - 3} riwayat expire lainnya*", inline=False)
+
+        await dest.send(embed=embed)
 
     # PERINTAH: clearwarns
     @commands.command(name="clearwarns", help="Hapus semua warn aktif milik member.")
@@ -633,7 +911,7 @@ class Moderation(commands.Cog, name="Moderasi"):
     @commands.guild_only()
     async def timeout(self, ctx, member: discord.Member, durasi: int = 10, *, alasan: str = "Tidak ada alasan."):
         if durasi < 1 or durasi > MAX_TIMEOUT_MIN:
-            return await ctx.send(embed=embeds.error(f"Durasi timeout harus antara 1–{MAX_TIMEOUT_MIN} menit (28 hari)."))
+            return await ctx.send(embed=embeds.error(f"Durasi timeout harus antara 1–{MAX_TIMEOUT_MIN} menit."))
         until = discord.utils.utcnow() + datetime.timedelta(minutes=durasi)
         await member.timeout(until, reason=alasan)
         embed = embeds.mod_action(f"⏱️ Timeout {durasi} Menit", member, ctx.author, alasan, discord.Color.yellow())
@@ -692,12 +970,13 @@ class Moderation(commands.Cog, name="Moderasi"):
         await ctx.channel.set_permissions(ctx.guild.default_role, overwrite=overwrite)
         await ctx.send(embed=embeds.success(f"Channel {ctx.channel.mention} **dibuka**. 🔓"))
 
-    # Error handler global
+    # Error handlers
     @kick.error
     @ban.error
     @timeout.error
     @warn.error
     @warnlist.error
+    @mywarns.error
     @clearwarns.error
     @clear.error
     async def mod_error(self, ctx, error):
