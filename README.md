@@ -33,8 +33,8 @@ discord-bot/
 
 ### 1. Clone & masuk ke folder
 ```bash
-git clone https://github.com/username/discord-bot.git
-cd discord-bot
+git clone https://github.com/YFadila/monmod.git
+cd monmod
 ```
 
 ### 2. Buat virtual environment
@@ -88,24 +88,24 @@ python main.py
 ### 🛡️ Moderasi
 | Perintah | Keterangan | Permission |
 |---|---|---|
-| `!kick @user [alasan]` | Kick member | Kick Members |
-| `!ban @user [alasan]` | Ban member | Ban Members |
-| `!unban Nama#1234` | Unban member | Ban Members |
-| `!timeout @user [menit] [alasan]` | Timeout member | Moderate Members |
-| `!untimeout @user` | Hapus timeout | Moderate Members |
-| `!warn @user [alasan]` | Peringatkan via DM | Manage Messages |
-| `!clear [1-100]` | Hapus pesan | Manage Messages |
-| `!slowmode [detik]` | Atur slowmode | Manage Channels |
-| `!lock` | Kunci channel | Manage Channels |
-| `!unlock` | Buka channel | Manage Channels |
+| `monkick @user [alasan]` | Kick member | Kick Members |
+| `monban @user [alasan]` | Ban member | Ban Members |
+| `monunban Nama#1234` | Unban member | Ban Members |
+| `montimeout @user [menit] [alasan]` | Timeout member | Moderate Members |
+| `monuntimeout @user` | Hapus timeout | Moderate Members |
+| `monwarn @user [alasan]` | Peringatkan via DM | Manage Messages |
+| `monclear [1-100]` | Hapus pesan | Manage Messages |
+| `monslowmode [detik]` | Atur slowmode | Manage Channels |
+| `monlock` | Kunci channel | Manage Channels |
+| `monunlock` | Buka channel | Manage Channels |
 
 ### ℹ️ Info
 | Perintah | Keterangan |
 |---|---|
-| `!userinfo [@user]` | Info lengkap member |
-| `!serverinfo` | Info server |
-| `!avatar [@user]` | Lihat avatar member |
-| `!ping` | Cek latensi bot |
+| `monuserinfo [@user]` | Info lengkap member |
+| `monserverinfo` | Info server |
+| `monavatar [@user]` | Lihat avatar member |
+| `monping` | Cek latensi bot |
 
 ---
 
