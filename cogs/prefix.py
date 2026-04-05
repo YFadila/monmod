@@ -1,17 +1,3 @@
-"""
-Cog: Prefix
-Sistem custom prefix per-guild.
-
-Cara kerja
-──────────
-- Prefix default diambil dari env BOT_PREFIX (fallback: "!").
-- Setiap guild bisa menyimpan prefix custom di data/prefixes.json.
-- Fungsi get_prefix() harus didaftarkan ke bot di main.py sebagai
-  command_prefix agar prefix custom benar-benar dipakai oleh discord.py.
-- Bot juga selalu merespons mention (@BotName <command>) sebagai prefix
-  darurat, sehingga admin tidak terkunci meski lupa prefix servernya.
-"""
-
 import json
 import logging
 import os
