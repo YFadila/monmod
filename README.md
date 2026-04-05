@@ -11,6 +11,7 @@ Bot moderasi server Discord sederhana, dibangun dengan `discord.py`.
 > - ✅ **Custom prefix per-server** — setiap server bisa pakai prefix sendiri
 > - ✅ **Auto Role** — member baru otomatis mendapat role saat join
 > - ✅ **Reaction Role** berbasis button — member pilih role sendiri lewat tombol interaktif
+> - ✅ **Sistem Logging terpusat** — 7 kategori log, channel terpisah per kategori, toggle on/off
 
 ---
 
@@ -28,6 +29,7 @@ discord-bot/
 │   ├── moderation.py     # Kick, ban, timeout, warn, config, dll.
 │   ├── prefix.py         # Custom prefix per-server
 │   ├── roles.py          # Auto role + reaction role (button)
+│   ├── logging_cog.py    # Sistem logging terpusat 7 kategori
 │   ├── info.py           # Userinfo, serverinfo, ping
 │   └── events.py         # on_ready, on_member_join, dll.
 │
@@ -40,7 +42,8 @@ discord-bot/
     ├── warns.json        # Riwayat warn semua member (soft-delete)
     ├── guild_config.json # Konfigurasi moderasi per-server
     ├── prefixes.json     # Custom prefix per-server
-    └── roles.json        # Data auto role & panel reaction role per-server
+    ├── roles.json        # Data auto role & panel reaction role per-server
+    └── log_config.json   # Konfigurasi logging per-server per-kategori
 ```
 
 ---
@@ -124,7 +127,6 @@ python main.py
 | `!warnhistory @user` | Alias dari `!warnlist` | Manage Messages |
 | `!mywarns` | Lihat riwayat warnmu sendiri (dikirim via DM) | Semua member |
 | `!clearwarns @user [alasan]` | Clear semua warn aktif (riwayat tetap tersimpan) | Administrator |
-| `!removewarn @user [alasan]` | Hapus 1 poin warn terlama | Manage Messages |
 
 **Threshold warn default** (dapat diubah per-server via `!config`):
 
@@ -155,11 +157,11 @@ Semua perintah `!config` hanya bisa digunakan oleh **Administrator** server. Set
 | `!config removewarn <N>` | `!config removewarn 5` | Hapus threshold warn ke-N |
 | `!config setTimeout <menit>` | `!config setTimeout 10` | Ubah durasi auto-timeout |
 | `!config setdecay <hari>` | `!config setdecay 14` | Ubah durasi decay warn (0 = nonaktif) |
-| `!config setlog <#channel>` | `!config setlog #mod-log` | Atur channel log moderasi |
-| `!config setlog clear` | — | Hapus channel log custom (kembali ke `.env`) |
 | `!config reset` | — | Reset semua konfigurasi server ke default |
 
 **Aksi yang tersedia untuk `setwarn`:** `timeout` · `kick` · `ban` · `none` (nonaktifkan threshold)
+
+> **Catatan:** Konfigurasi channel log moderasi kini dikelola sepenuhnya via `!logset channel moderation #channel`. Perintah `!config setlog` sudah dihapus.
 
 ### 🔧 Custom Prefix
 Setiap server bisa mengatur prefix sendiri. Bot juga **selalu** merespons mention (`@BotName`) sebagai prefix darurat jika prefix terlupa.
@@ -211,6 +213,47 @@ Member memilih role sendiri dengan klik tombol di pesan panel. Klik sekali = dap
 
 > **Catatan:** Tombol panel tetap berfungsi setelah bot restart karena menggunakan *persistent view*. Maksimum **25 tombol** per panel (5 baris × 5 tombol, batas Discord).
 
+### 📋 Sistem Logging
+Logging terpusat dengan 7 kategori. Tiap kategori bisa punya channel sendiri dan bisa di-toggle on/off secara independen. Semua perintah `!logset` hanya bisa digunakan oleh **Administrator**.
+
+**Kategori yang tersedia:**
+
+| Kategori | Keterangan |
+|---|---|
+| `moderation` | Kick, ban, warn, timeout, clear warn |
+| `messages` | Pesan dihapus & diedit (dengan konten asli dari cache) |
+| `members` | Member join, leave, nickname berubah, username berubah |
+| `roles` | Role diberi/dilepas dari member, role dibuat/dihapus/diedit |
+| `channels` | Channel dibuat, dihapus, diedit (nama, topic, slowmode) |
+| `server` | Nama server, icon, level verifikasi, dll berubah |
+| `voice` | Join, leave, pindah antar voice channel |
+
+**Perintah konfigurasi:**
+
+| Perintah | Contoh | Keterangan |
+|---|---|---|
+| `!logset status` | — | Lihat status semua kategori (aktif/nonaktif + channel) |
+| `!logset channel <kategori> <#channel>` | `!logset channel messages #message-log` | Set channel log untuk satu kategori |
+| `!logset enable <kategori>` | `!logset enable messages` | Aktifkan satu kategori |
+| `!logset disable <kategori>` | `!logset disable voice` | Nonaktifkan satu kategori |
+| `!logset enableall` | — | Aktifkan semua kategori sekaligus |
+| `!logset disableall` | — | Nonaktifkan semua kategori sekaligus |
+| `!logset reset` | — | Reset seluruh konfigurasi log server ini |
+
+**Contoh setup recommended:**
+```
+!logset channel moderation #mod-log
+!logset channel messages   #message-log
+!logset channel members    #member-log
+!logset channel roles      #mod-log
+!logset channel channels   #mod-log
+!logset channel server     #mod-log
+!logset channel voice      #voice-log
+!logset enableall
+```
+
+> **Catatan:** Log moderasi dari `!warn`, `!ban`, `!kick`, dll otomatis masuk ke kategori `moderation`. Jika cog logging tidak aktif, log akan fallback ke `LOG_CHANNEL_ID` dari `.env` seperti sebelumnya.
+
 ### ℹ️ Info
 | Perintah | Keterangan |
 |---|---|
@@ -261,7 +304,8 @@ async def setup(bot):
 3. Daftarkan di `main.py`:
 ```python
 COGS = [
-    "cogs.prefix",        # selalu pertama
+    "cogs.prefix",
+    "cogs.logging_cog",   # load awal agar cog lain bisa kirim log
     "cogs.moderation",
     "cogs.roles",
     "cogs.info",

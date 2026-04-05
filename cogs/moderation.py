@@ -1,29 +1,6 @@
-"""
-Cog: Moderasi
-Semua perintah moderasi server + sistem konfigurasi per-guild.
-
-Sistem Warn Decay — Hybrid (Lazy + Daily Sweep)
-────────────────────────────────────────────────
-- Setiap warn aktif punya timer decay yang dihitung dari tanggal WARN TERAKHIR
-  yang diterima member (bukan dari tanggal warn itu sendiri).
-- Jika member punya N warn aktif, poin ke-1 expire di (last_warn + 1×decay_days),
-  poin ke-2 expire di (last_warn + 2×decay_days), dst.
-- Jika member menerima warn baru, semua timer reset ulang dari tanggal warn baru itu.
-- Warn yang expire otomatis ditandai status "expired" (soft-delete) untuk audit trail.
-
-Dua lapis pengecekan:
-  1. LAZY CHECK  — dijalankan setiap kali ada aktivitas warn pada member tertentu
-                   (!warn, !warnlist, !mywarns, !clearwarns).
-  2. DAILY SWEEP — background task yang jalan sekali sehari (00:00 UTC), memproses
-                   decay untuk SEMUA member di SEMUA guild secara sekaligus.
-                   Menjamin warn yang sudah melewati batas tetap expire meski member
-                   tidak pernah berinteraksi dengan sistem warn.
-"""
-
 import datetime
 import json
 import logging
-import os
 from pathlib import Path
 
 import discord
@@ -52,8 +29,6 @@ DEFAULT_CONFIG = {
     # Contoh: decay=30, 2 warn → poin 1 hilang di hari ke-30, poin 2 di hari ke-60
     # Set ke 0 untuk menonaktifkan decay (warn tidak pernah expire otomatis)
     "warn_decay_days": 30,
-    # ID channel log moderasi (override .env per-guild, null = pakai .env)
-    "log_channel_id": None,
 }
 
 # Batas nilai
@@ -61,6 +36,7 @@ VALID_ACTIONS   = {"timeout", "kick", "ban", "none"}
 MAX_WARN_COUNT  = 50
 MAX_TIMEOUT_MIN = 40320    # 28 hari (batas Discord)
 MAX_DECAY_DAYS  = 365
+
 
 # Helper: guild config
 def _load_config() -> dict:
@@ -93,7 +69,6 @@ def get_guild_config(guild_id: int) -> dict:
         },
         "timeout_duration": guild_cfg.get("timeout_duration", DEFAULT_CONFIG["timeout_duration"]),
         "warn_decay_days":  guild_cfg.get("warn_decay_days",  DEFAULT_CONFIG["warn_decay_days"]),
-        "log_channel_id":   guild_cfg.get("log_channel_id",   DEFAULT_CONFIG["log_channel_id"]),
     }
 
 
@@ -272,7 +247,7 @@ def _decay_info(active_sorted: list, decay_days: int) -> list[str]:
     return result
 
 
-# Cog utama
+# Cog Utama
 class Moderation(commands.Cog, name="Moderasi"):
     """Perintah-perintah moderasi server."""
 
@@ -349,12 +324,9 @@ class Moderation(commands.Cog, name="Moderasi"):
 
     # ── Log channel ───────────────────────────────────────────────────────
     async def send_log(self, guild: discord.Guild, embed: discord.Embed):
-        cfg        = get_guild_config(guild.id)
-        channel_id = cfg["log_channel_id"] or os.getenv("LOG_CHANNEL_ID")
-        if channel_id:
-            channel = guild.get_channel(int(channel_id))
-            if channel:
-                await channel.send(embed=embed)
+        """Kirim log moderasi ke sistem logging terpusat (kategori 'moderation')."""
+        from cogs.logging import send_log as central_send_log
+        await central_send_log(guild, "moderation", embed)
 
     # ── Tindakan otomatis berdasarkan warn count ───────────────────────────
     async def _apply_threshold_action(
@@ -428,7 +400,6 @@ class Moderation(commands.Cog, name="Moderasi"):
                 "`!config removewarn <N>` — Hapus threshold warn ke-N\n"
                 "`!config setTimeout <menit>` — Atur durasi auto-timeout\n"
                 "`!config setdecay <hari>` — Atur durasi decay warn (0 = nonaktif)\n"
-                "`!config setlog <#channel | clear>` — Atur channel log moderasi\n"
                 "`!config reset` — Kembalikan semua config ke default\n"
             ),
             inline=False
@@ -474,11 +445,6 @@ class Moderation(commands.Cog, name="Moderasi"):
             value=f"**{decay} hari** per poin" if decay > 0 else "**Nonaktif**",
             inline=True
         )
-
-        # Log channel
-        log_id  = cfg["log_channel_id"] or os.getenv("LOG_CHANNEL_ID")
-        log_val = f"<#{log_id}>" if log_id else "*(belum diatur)*"
-        embed.add_field(name="📋 Log Channel", value=log_val, inline=True)
 
         embed.set_footer(text="Gunakan !config untuk melihat daftar perintah pengaturan.")
         await ctx.send(embed=embed)
@@ -562,32 +528,6 @@ class Moderation(commands.Cog, name="Moderasi"):
             )
         await ctx.send(embed=embeds.success(desc, title="✅ Decay Warn Diperbarui"))
         logger.info(f"CONFIG setdecay | Guild {ctx.guild.id} | {hari} hari oleh {ctx.author}")
-
-    # ── !config setlog ────────────────────────────────────────────────────
-    @config_group.command(name="setlog", help="Atur channel log moderasi. Contoh: !config setlog #mod-log")
-    @commands.has_permissions(administrator=True)
-    @commands.guild_only()
-    async def config_set_log(self, ctx, *, target: str):
-        target = target.strip()
-        if target.lower() == "clear":
-            _set_guild_value(ctx.guild.id, "log_channel_id", None)
-            return await ctx.send(embed=embeds.success(
-                "Log channel dihapus. Bot akan pakai `LOG_CHANNEL_ID` dari env (jika ada).",
-                title="✅ Log Channel Dihapus"
-            ))
-        channel = None
-        if ctx.message.channel_mentions:
-            channel = ctx.message.channel_mentions[0]
-        elif target.isdigit():
-            channel = ctx.guild.get_channel(int(target))
-        if not channel:
-            return await ctx.send(embed=embeds.error("Channel tidak ditemukan. Mention channel atau kirim ID-nya."))
-        _set_guild_value(ctx.guild.id, "log_channel_id", channel.id)
-        await ctx.send(embed=embeds.success(
-            f"Log moderasi akan dikirim ke {channel.mention}.",
-            title="✅ Log Channel Diperbarui"
-        ))
-        logger.info(f"CONFIG setlog | Guild {ctx.guild.id} | #{channel.name} oleh {ctx.author}")
 
     # ── !config reset ─────────────────────────────────────────────────────
     @config_group.command(name="reset", help="Kembalikan seluruh config server ke default.")

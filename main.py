@@ -1,7 +1,3 @@
-"""
-main.py — Entry point Discord Moderation Bot
-"""
-
 import asyncio
 import logging
 import os
@@ -20,6 +16,7 @@ logger = logging.getLogger("discord_bot")
 # Daftar cog yang akan di-load (urutan bebas)
 COGS = [
     "cogs.prefix",        # ← harus di-load agar get_prefix bisa bekerja
+    "cogs.logging",   # logging terpusat — load awal agar cog lain bisa pakai
     "cogs.moderation",
     "cogs.roles",         # auto role + reaction role
     "cogs.info",
