@@ -21,6 +21,7 @@ logger = logging.getLogger("discord_bot")
 COGS = [
     "cogs.prefix",        # ← harus di-load agar get_prefix bisa bekerja
     "cogs.moderation",
+    "cogs.roles",         # auto role + reaction role
     "cogs.info",
     "cogs.events",
 ]

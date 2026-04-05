@@ -9,6 +9,8 @@ Bot moderasi server Discord sederhana, dibangun dengan `discord.py`.
 > - ✅ Sistem **konfigurasi per-server** (`!config`) tanpa perlu deploy ulang
 > - ✅ Sistem **warn decay** otomatis — poin warn hilang sendiri setelah N hari tanpa pelanggaran
 > - ✅ **Custom prefix per-server** — setiap server bisa pakai prefix sendiri
+> - ✅ **Auto Role** — member baru otomatis mendapat role saat join
+> - ✅ **Reaction Role** berbasis button — member pilih role sendiri lewat tombol interaktif
 
 ---
 
@@ -25,6 +27,7 @@ discord-bot/
 ├── cogs/                 # Modul perintah (dipisah per kategori)
 │   ├── moderation.py     # Kick, ban, timeout, warn, config, dll.
 │   ├── prefix.py         # Custom prefix per-server
+│   ├── roles.py          # Auto role + reaction role (button)
 │   ├── info.py           # Userinfo, serverinfo, ping
 │   └── events.py         # on_ready, on_member_join, dll.
 │
@@ -36,7 +39,8 @@ discord-bot/
 └── data/                 # Penyimpanan data lokal (di-generate otomatis)
     ├── warns.json        # Riwayat warn semua member (soft-delete)
     ├── guild_config.json # Konfigurasi moderasi per-server
-    └── prefixes.json     # Custom prefix per-server
+    ├── prefixes.json     # Custom prefix per-server
+    └── roles.json        # Data auto role & panel reaction role per-server
 ```
 
 ---
@@ -45,8 +49,8 @@ discord-bot/
 
 ### 1. Clone & masuk ke folder
 ```bash
-git clone https://github.com/YFadila/monmod.git
-cd monmod
+git clone https://github.com/YFadila/MonMod.git
+cd MonMod
 ```
 
 ### 2. Buat virtual environment
@@ -120,6 +124,7 @@ python main.py
 | `!warnhistory @user` | Alias dari `!warnlist` | Manage Messages |
 | `!mywarns` | Lihat riwayat warnmu sendiri (dikirim via DM) | Semua member |
 | `!clearwarns @user [alasan]` | Clear semua warn aktif (riwayat tetap tersimpan) | Administrator |
+| `!removewarn @user [alasan]` | Hapus 1 poin warn terlama | Manage Messages |
 
 **Threshold warn default** (dapat diubah per-server via `!config`):
 
@@ -166,6 +171,45 @@ Setiap server bisa mengatur prefix sendiri. Bot juga **selalu** merespons mentio
 | `!resetprefix` | — | Kembalikan prefix ke default | Administrator |
 
 > **Tips:** Jika lupa prefix server, selalu bisa pakai `@BotName setprefix !` untuk reset via mention.
+
+### 🎭 Auto Role
+Role yang didaftarkan otomatis diberikan ke member baru saat join server.
+
+| Perintah | Contoh | Keterangan | Permission |
+|---|---|---|---|
+| `!autorole list` | — | Lihat daftar auto role aktif | Manage Roles |
+| `!autorole add <@role>` | `!autorole add @Member` | Tambah role ke daftar auto role | Manage Roles |
+| `!autorole remove <@role>` | `!autorole remove @Member` | Hapus role dari daftar auto role | Manage Roles |
+| `!autorole clear` | — | Hapus semua auto role | Administrator |
+
+> **Catatan:** Role dengan permission **Administrator** tidak bisa didaftarkan sebagai auto role. Bot juga tidak bisa memberikan role yang posisinya lebih tinggi dari role bot sendiri.
+
+### 🎛️ Reaction Role (Button)
+Member memilih role sendiri dengan klik tombol di pesan panel. Klik sekali = dapat role, klik lagi = lepas role (toggle). Panel dikelompokkan per kategori dan bisa lebih dari satu.
+
+**Kelola panel:**
+
+| Perintah | Contoh | Keterangan | Permission |
+|---|---|---|---|
+| `!panel list` | — | Lihat semua panel yang ada | Manage Roles |
+| `!panel create <nama>` | `!panel create Game` | Buat panel baru | Manage Roles |
+| `!panel desc <id> <teks>` | `!panel desc abc12345 Pilih gamemu!` | Atur deskripsi panel | Manage Roles |
+| `!panel addrole <id> <@role> <label> [emoji]` | `!panel addrole abc12345 @Valorant Valorant 🎯` | Tambah role ke panel | Manage Roles |
+| `!panel removerole <id> <@role>` | `!panel removerole abc12345 @Valorant` | Hapus role dari panel | Manage Roles |
+| `!panel send <id> [#channel]` | `!panel send abc12345 #role-picker` | Kirim/perbarui panel ke channel | Manage Roles |
+| `!panel delete <id>` | `!panel delete abc12345` | Hapus panel beserta pesannya | Administrator |
+
+**Contoh alur kerja lengkap:**
+```
+!panel create Game
+!panel desc abc12345 Pilih game favoritmu untuk akses channel khusus!
+!panel addrole abc12345 @Valorant Valorant 🎯
+!panel addrole abc12345 @MLBB Mobile Legends 🗡️
+!panel addrole abc12345 @Minecraft Minecraft ⛏️
+!panel send abc12345 #pilih-role
+```
+
+> **Catatan:** Tombol panel tetap berfungsi setelah bot restart karena menggunakan *persistent view*. Maksimum **25 tombol** per panel (5 baris × 5 tombol, batas Discord).
 
 ### ℹ️ Info
 | Perintah | Keterangan |
@@ -219,6 +263,7 @@ async def setup(bot):
 COGS = [
     "cogs.prefix",        # selalu pertama
     "cogs.moderation",
+    "cogs.roles",
     "cogs.info",
     "cogs.events",
     "cogs.fun",   # ← tambahkan di sini

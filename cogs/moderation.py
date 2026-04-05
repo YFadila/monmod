@@ -62,7 +62,6 @@ MAX_WARN_COUNT  = 50
 MAX_TIMEOUT_MIN = 40320    # 28 hari (batas Discord)
 MAX_DECAY_DAYS  = 365
 
-
 # Helper: guild config
 def _load_config() -> dict:
     try:
@@ -168,6 +167,36 @@ def _soft_clear_warns(
             w["cleared_waktu"]   = waktu_clear
             count += 1
     return count
+
+
+def _soft_clear_one_warn(
+    data: dict,
+    guild_id: int,
+    member_id: int,
+    warn_index: int,
+    cleared_by_id: int,
+    cleared_by_nama: str,
+    alasan_clear: str = "Tidak ada alasan.",
+) -> dict | None:
+    """
+    Tandai SATU warn aktif (warn_index 1-based, terlama=1) sebagai 'cleared'.
+    Kembalikan warn entry yang di-clear, atau None jika index tidak valid.
+    """
+    active_sorted = sorted(
+        _get_active_warns(data, guild_id, member_id),
+        key=lambda w: w.get("waktu", "")
+    )
+    if warn_index < 1 or warn_index > len(active_sorted):
+        return None
+
+    target                    = active_sorted[warn_index - 1]
+    waktu_clear               = discord.utils.utcnow().isoformat()
+    target["status"]          = "cleared"
+    target["cleared_by_id"]   = cleared_by_id
+    target["cleared_by_nama"] = cleared_by_nama
+    target["cleared_alasan"]  = alasan_clear
+    target["cleared_waktu"]   = waktu_clear
+    return target
 
 
 # Sistem Decay — lazy check
@@ -859,6 +888,63 @@ class Moderation(commands.Cog, name="Moderasi"):
         await self.send_log(ctx.guild, embed)
         logger.info(f"CLEARWARNS | {jumlah} warn {member} di-clear oleh {ctx.author} | Alasan: {alasan}")
 
+    # PERINTAH: removewarn  (hapus 1 poin warn TERLAMA)
+    @commands.command(
+        name="removewarn",
+        aliases=["delwarn"],
+        help="Hapus 1 poin warn terlama milik member. Contoh: !removewarn @user [alasan]"
+    )
+    @commands.has_permissions(manage_messages=True)
+    @commands.guild_only()
+    async def removewarn(self, ctx, member: discord.Member, *, alasan: str = "Tidak ada alasan."):
+        if member == ctx.author:
+            return await ctx.send(embed=embeds.error("Kamu tidak bisa menghapus warnmu sendiri."))
+
+        data        = _load_warns()
+        active_list = _get_active_warns(data, ctx.guild.id, member.id)
+
+        if not active_list:
+            return await ctx.send(embed=embeds.error(
+                f"{member.mention} tidak memiliki warn aktif."
+            ))
+
+        total_aktif = len(active_list)
+
+        # Hapus poin ke-1 (terlama) — index 1-based
+        cleared = _soft_clear_one_warn(
+            data, ctx.guild.id, member.id,
+            warn_index=1,
+            cleared_by_id=ctx.author.id,
+            cleared_by_nama=str(ctx.author),
+            alasan_clear=alasan
+        )
+        _save_warns(data)
+
+        sisa = total_aktif - 1
+
+        try:
+            warn_tgl = discord.utils.format_dt(
+                datetime.datetime.fromisoformat(cleared["waktu"]), style="d"
+            )
+        except (KeyError, ValueError):
+            warn_tgl = "?"
+
+        embed = embeds.success(
+            f"1 poin warn terlama milik {member.mention} berhasil dihapus.\n\n"
+            f"**Alasan warn asli:** {cleared.get('alasan', '-')} *(diberikan {warn_tgl})*\n"
+            f"**Alasan dihapus:** {alasan}\n"
+            f"**Sisa warn aktif:** {sisa} poin\n\n"
+            f"*Riwayat tetap tersimpan dan bisa dilihat dengan `!warnlist`.*",
+            title="🗑️ Warn Terlama Dihapus"
+        )
+        embed.set_footer(text=f"Oleh: {ctx.author}")
+        await ctx.send(embed=embed)
+        await self.send_log(ctx.guild, embed)
+        logger.info(
+            f"REMOVEWARN | Poin terlama {member} di-clear oleh {ctx.author} | "
+            f"Alasan: {alasan} | Sisa: {sisa}"
+        )
+
     # PERINTAH MODERASI STANDAR
     @commands.command(name="kick", help="Kick member dari server.")
     @commands.has_permissions(kick_members=True)
@@ -977,6 +1063,7 @@ class Moderation(commands.Cog, name="Moderasi"):
     @warn.error
     @warnlist.error
     @mywarns.error
+    @removewarn.error
     @clearwarns.error
     @clear.error
     async def mod_error(self, ctx, error):
